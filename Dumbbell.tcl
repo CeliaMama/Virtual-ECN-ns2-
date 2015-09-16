@@ -1,36 +1,52 @@
 #####Build a dumbbell model with N senders and N receivers communicating
 #####through two connected routers
 
+####### s0                                                  r1
+#######   \                                                 /
+####### s1\\ lineRate RTT1                    lineRate RTT3//r2
+####### .  \\        bottleNeckLinkDataRate  RTT2         //  .
+####### . -/ nqueue1-------------------------------nqueue2 ---.
+####### . /   (RED)                             (DropTail) \
+####### sN                                                 rN
+
 
 
 set N 10
 set bottleNeckLinkDataRate 1Gb
 set lineRate 1Gb
-set RTT1 0.04
+set RTT1 0.01
 set RTT2 0.02
 set RTT3 0.01
 set packetSize 1460
-set routerBufferSize [expr round($RTT2 * 1000000000 / 8 /$packetSize)]   
+
+##### set buffer size to delay-bandwidth product
+set routerBufferSize [expr round($RTT2 * 1000000000 / 8 / $packetSize)]   
 
 
-set simulationTime 1.0
+set simulationTime 20.0
 set startMeasurementTime 0.0
-set stopMeasurementTime 100.0
+set stopMeasurementTime 20.0
 set flowClassifyTime 0.04
 
+#########set TCP CC protocol
 set congestionControlAlg NewReno
 #set congestionControlAlg Cubic
 
 set switchQueueAlg RED
 
-set traceSamplingInterval 0.0001
-set enableNam 1
+set traceSamplingInterval 0.01
+set throughputSamplingInterval 0.01
+set enableNam 0
 set ns [new Simulator]
 
 Agent/TCP set ecn_ 1
+Agent/TCP set old_ecn_ 1
 Agent/TCP set packetSize_ $packetSize
-Agent/TCP set window_ [expr $routerBufferSize + 10]
-
+Agent/TCP set window_ 4000
+Agent/TCP set slow_start_restart_ false
+Agent/TCP set tcpTick_ 0.01
+Agent/TCP set minrto_ 0.2
+Agent/TCP set windowOption_ 0
 
 Queue set limit_ $routerBufferSize
 Queue/RED set bytes_ false
@@ -38,8 +54,11 @@ Queue/RED set queue_in_bytes true
 Queue/RED set mean_pktsize_ $packetSize
 Queue/RED set setbit_ true
 Queue/RED set q_weight_ 1.0
+Queue/RED set mark_p_ 1.0
 Queue/RED set thresh_ [expr $routerBufferSize/2]
-Queue/RED set maxthresh_ [expr $routerBufferSize]
+Queue/RED set maxthresh_ [expr $routerBufferSize/2]
+Queue/RED set gentle_ false
+
 
 DelayLink set avoidReordering_ true
 
@@ -52,11 +71,14 @@ if {$enableNam != 0} {
 set tf [open outNewReno.tr w]
 $ns trace-all $tf
 
-
+set mytracefile [open mytracefileNewReno.tr w]
+set throughputfile [open thrfileNewReno.tr w]
 proc finish {} {
-	global ns enableNam namfile tf
+	global ns enableNam namfile tf mytracefile throughputfile
 	$ns flush-trace
 	close $tf
+	close $mytracefile
+	close $throughputfile
 	if {$enableNam != 0} {
 		close $namfile
 		exec nam outNewReno.nam &
@@ -64,6 +86,57 @@ proc finish {} {
 	exit 0
 }
 
+proc myTrace {file} {
+	global ns N traceSamplingInterval tcp qfile MainLink nbow nclient packetSize enable BumponWire
+
+	set now [$ns now]
+
+	for {set i 0} {$i < $N} {incr i} {
+		set cwnd($i) [$tcp($i) set cwnd_]
+	}
+
+	$qfile instvar parrivals_ pdepartures_ pdrops_ bdepartures_
+
+	puts -nonewline $file "$now $cwnd(0)"
+	for {set i 1} {$i < $N} {incr i} {
+    puts -nonewline $file " $cwnd($i)"
+    }
+
+    puts -nonewline $file " [expr $parrivals_-$pdepartures_-$pdrops_]"    
+    puts $file " $pdrops_"
+     
+    $ns at [expr $now+$traceSamplingInterval] "myTrace $file"
+}
+
+
+proc throughputTrace {file} {
+    global ns throughputSamplingInterval qfile flowstats N flowClassifyTime
+    
+    set now [$ns now]
+    
+    $qfile instvar bdepartures_
+    
+    puts -nonewline $file "$now [expr $bdepartures_*8/$throughputSamplingInterval/1000000]"
+    set bdepartures_ 0
+    if {$now <= $flowClassifyTime} {
+    for {set i 0} {$i < [expr $N-1]} {incr i} {
+        puts -nonewline $file " 0"
+    }
+    puts $file " 0"
+    }
+
+    if {$now > $flowClassifyTime} { 
+    for {set i 0} {$i < [expr $N-1]} {incr i} {
+        $flowstats($i) instvar barrivals_
+        puts -nonewline $file " [expr $barrivals_*8/$throughputSamplingInterval/1000000]"
+        set barrivals_ 0
+    }
+    $flowstats([expr $N-1]) instvar barrivals_
+    puts $file " [expr $barrivals_*8/$throughputSamplingInterval/1000000]"
+    set barrivals_ 0
+    }
+    $ns at [expr $now+$throughputSamplingInterval] "throughputTrace $file"
+}
 $ns color 0 Red
 $ns color 1 Orange
 $ns color 2 Yellow
@@ -75,7 +148,8 @@ $ns color 7 Black
 $ns color 8 Purple
 $ns color 9 SeaGreen
 
-
+global defaultRNG
+$defaultRNG seed 10
 
 for {set i 0} {$i < $N} {incr i} {
 	set s($i) [$ns node]
@@ -96,7 +170,7 @@ $ns queue-limit $nqueue1 $nqueue2 $routerBufferSize
 
 $ns duplex-link-op $nqueue1 $nqueue2 color "green"
 $ns duplex-link-op $nqueue1 $nqueue2 queuePos 0.25
-#set qfile [$ns monitor-queue $nqueue1 $nqueue2 [open queue.tr w] $traceSamplingInterval]
+set qfile [$ns monitor-queue $nqueue1 $nqueue2 [open queue.tr w]]
 
 
 ####Create Error Model
@@ -153,10 +227,48 @@ for {set i 0} {$i < $N} {incr i} {
 	$ns at [expr $simulationTime] "$ftp($i) stop"
 }
 
+$ns at $traceSamplingInterval "myTrace $mytracefile"
+$ns at $throughputSamplingInterval "throughputTrace $throughputfile"
 
+set flowmon [$ns makeflowmon Fid]
+set MainLink [$ns link $nqueue1 $nqueue2]
+
+$ns attach-fmon $MainLink $flowmon
+
+set fcl [$flowmon classifier]
+
+$ns at $flowClassifyTime "classifyFlows"
+
+proc classifyFlows {} {
+    global N fcl flowstats
+    puts "NOW CLASSIFYING FLOWS"
+    for {set i 0} {$i < $N} {incr i} {
+    set flowstats($i) [$fcl lookup autp 0 0 $i]
+    }
+} 
+
+
+set startPacketCount 0
+set stopPacketCount 0
+
+proc startMeasurement {} {
+global qfile startPacketCount
+$qfile instvar pdepartures_   
+set startPacketCount $pdepartures_
+}
+
+proc stopMeasurement {} {
+global qfile startPacketCount stopPacketCount packetSize startMeasurementTime stopMeasurementTime simulationTime
+$qfile instvar pdepartures_   
+set stopPacketCount $pdepartures_
+puts "Throughput = [expr ($stopPacketCount-$startPacketCount)/(1000000*($stopMeasurementTime-$startMeasurementTime))*$packetSize*8] Mbps"
+}
+
+$ns at $startMeasurementTime "startMeasurement"
+$ns at $stopMeasurementTime "stopMeasurement"
+                      
 $ns at $simulationTime "finish"
 $ns run
-
 
 
 
